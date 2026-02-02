@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Shopify Public App OAuth stack.
+  Provisions a Lambda function behind an API Gateway HTTP API (v2) that handles
+  the /install and /oauth/callback routes.  Access tokens are stored in
+  Secrets Manager under the shopify/* namespace.
+
+  Prerequisites:
+    - Upload a deployment zip (lambda_function.py + requests library) to S3.
+    - Pass the bucket/key as parameters below.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  ShopifyApiKey:
+    Type: String
+    Description: Public API key from the Shopify Partner dashboard.
+
+  ShopifyApiSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret key from the Shopify Partner dashboard (never logged).
+
+  Scopes:
+    Type: String
+    Default: read_products,read_orders
+    Description: Comma-separated Shopify OAuth scopes.
+
+  RedirectUri:
+    Type: String
+    Description: >
+      Full callback URL.  After the first deploy you can update this to
+      https://<ApiId>.execute-api.<Region>.amazonaws.com/oauth/callback
+      using the ApiBaseUrl output.
+
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment zip.
+
+  CodeS3Key:
+    Type: String
+    Description: S3 object key for the Lambda deployment zip.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # 1. IAM Role — least-privilege for Lambda execution
+  # -------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # -- CloudWatch Logs --------------------------------------------------
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-function:*"
+
+        # -- Secrets Manager (scoped to shopify/* secrets) --------------------
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:shopify/*"
+
+  # -------------------------------------------------------------------------
+  # 2. Lambda Function
+  # -------------------------------------------------------------------------
+  OAuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-function"
+      Description: Shopify OAuth install and callback handler.
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 15
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      Environment:
+        Variables:
+          SHOPIFY_API_KEY: !Ref ShopifyApiKey
+          SHOPIFY_API_SECRET: !Ref ShopifyApiSecret
+          SCOPES: !Ref Scopes
+          REDIRECT_URI: !Ref RedirectUri
+
+  # -------------------------------------------------------------------------
+  # 3. API Gateway HTTP API (v2)
+  # -------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+      Description: HTTP API fronting the Shopify OAuth Lambda.
+
+  # -- Lambda integration (AWS_PROXY with payload v2.0) ---------------------
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OAuthFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  # -- Catch-all proxy route: ANY /{proxy+} --------------------------------
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  # -- $default stage with auto-deploy -------------------------------------
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  # -------------------------------------------------------------------------
+  # 4. Lambda permission — allow API Gateway to invoke the function
+  # -------------------------------------------------------------------------
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OAuthFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: >
+      Base URL of the HTTP API.  Append /install?shop=<domain> to start OAuth.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  FunctionName:
+    Description: Name of the deployed Lambda function.
+    Value: !Ref OAuthFunction
+
+  FunctionArn:
+    Description: ARN of the deployed Lambda function.
+    Value: !GetAtt OAuthFunction.Arn
+
+  ExecutionRoleArn:
+    Description: ARN of the Lambda execution role.
+    Value: !GetAtt LambdaExecutionRole.Arn
