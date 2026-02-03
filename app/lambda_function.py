@@ -145,12 +145,14 @@ def store_token(shop: str, access_token: str) -> None:
     """
     Persist the shop's access token in AWS Secrets Manager.
 
-    Secret name format: ``shopify/<shop_domain>``
-    (e.g. ``shopify/my-store.myshopify.com``).
+    Secret name format: ``shopify/<store_name>``
+    (e.g. ``shopify/my-store`` for shop ``my-store.myshopify.com``).
 
     If the secret already exists it is updated; otherwise a new one is created.
     """
-    secret_name = f"shopify/{shop}"
+    # Strip .myshopify.com suffix for cleaner secret names.
+    store_name = shop.removesuffix(".myshopify.com")
+    secret_name = f"shopify/{store_name}"
     secret_value = json.dumps({
         "shop": shop,
         "access_token": access_token,
