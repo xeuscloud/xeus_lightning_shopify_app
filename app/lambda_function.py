@@ -18,7 +18,8 @@ IAM permissions required on the Lambda execution role:
             "secretsmanager:CreateSecret",
             "secretsmanager:PutSecretValue",
             "secretsmanager:UpdateSecret",
-            "secretsmanager:DescribeSecret"
+            "secretsmanager:DescribeSecret",
+            "secretsmanager:DeleteSecret"
         ],
         "Resource": "arn:aws:secretsmanager:<region>:<account-id>:secret:shopify/*"
     }
@@ -26,6 +27,7 @@ IAM permissions required on the Lambda execution role:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -74,6 +76,58 @@ def _error(status: int, message: str) -> dict:
 # ---------------------------------------------------------------------------
 # Helper — HMAC validation
 # ---------------------------------------------------------------------------
+
+def verify_shopify_webhook(headers: dict, raw_body: str) -> bool:
+    """
+    Verify Shopify webhook HMAC signature.
+
+    Args:
+        headers: Request headers (case-insensitive lookup)
+        raw_body: Raw request body string (before JSON parsing)
+
+    Returns:
+        True if signature is valid, False otherwise.
+    """
+    # Case-insensitive header lookup
+    hmac_header = None
+    for key, value in headers.items():
+        if key.lower() == "x-shopify-hmac-sha256":
+            hmac_header = value
+            break
+
+    if not hmac_header:
+        print("[Webhook] Missing X-Shopify-Hmac-Sha256 header")
+        return False
+
+    # Compute HMAC-SHA256 and base64 encode
+    computed = base64.b64encode(
+        hmac.new(
+            SHOPIFY_API_SECRET.encode("utf-8"),
+            raw_body.encode("utf-8") if isinstance(raw_body, str) else raw_body,
+            hashlib.sha256
+        ).digest()
+    ).decode("utf-8")
+
+    # Constant-time comparison
+    is_valid = hmac.compare_digest(computed, hmac_header)
+
+    if not is_valid:
+        print("[Webhook] HMAC verification failed")
+
+    return is_valid
+
+
+def _get_raw_body(event: dict) -> str:
+    """
+    Extract raw request body from API Gateway event.
+
+    Handles base64-encoded bodies when isBase64Encoded is True.
+    """
+    body = event.get("body", "") or ""
+    if event.get("isBase64Encoded", False) and body:
+        body = base64.b64decode(body).decode("utf-8")
+    return body
+
 
 def verify_hmac(query_params: dict[str, str], secret: str) -> bool:
     """
@@ -222,6 +276,10 @@ def handle_callback(event: dict) -> dict:
     2. Exchanges the authorization ``code`` for a permanent access token.
     3. Stores the token in Secrets Manager keyed by shop domain.
     4. Redirects to the Shopify admin page for the app.
+
+    NOTE: Compliance webhooks (customers/data_request, customers/redact,
+    shop/redact) are now registered via shopify.app.toml and deployed
+    through Shopify CLI — no longer registered here.
     """
     params = event.get("queryStringParameters") or {}
 
@@ -257,6 +315,68 @@ def handle_callback(event: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Webhook handlers (GDPR compliance)
+# ---------------------------------------------------------------------------
+
+def _handle_compliance_webhook(event: dict, topic: str) -> dict:
+    """
+    Generic handler for all compliance webhooks.
+
+    1. Extract raw body BEFORE any parsing
+    2. Verify HMAC on the raw body
+    3. Return 200 immediately
+    4. Log and process AFTER verification
+    """
+    headers = event.get("headers", {})
+    raw_body = _get_raw_body(event)
+
+    if not verify_shopify_webhook(headers, raw_body):
+        return _error(401, "Unauthorized")
+
+    # Parse AFTER HMAC verification
+    try:
+        payload = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        payload = {}
+
+    shop_domain = payload.get("shop_domain", "unknown")
+    print(f"[GDPR] {topic} - shop: {shop_domain}")
+
+    # shop/redact: clean up stored credentials
+    if topic == "shop/redact" and payload.get("shop_domain"):
+        try:
+            store_name = payload["shop_domain"].removesuffix(".myshopify.com")
+            _sm_client.delete_secret(
+                SecretId=f"shopify/{store_name}",
+                ForceDeleteWithoutRecovery=True,
+            )
+            print(f"[GDPR] Deleted secret: shopify/{store_name}")
+        except ClientError as exc:
+            print(f"[GDPR] Could not delete secret: {exc}")
+
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"success": True}),
+    }
+
+
+def handle_webhook_customers_data_request(event: dict) -> dict:
+    """POST /webhooks/customers/data_request"""
+    return _handle_compliance_webhook(event, "customers/data_request")
+
+
+def handle_webhook_customers_redact(event: dict) -> dict:
+    """POST /webhooks/customers/redact"""
+    return _handle_compliance_webhook(event, "customers/redact")
+
+
+def handle_webhook_shop_redact(event: dict) -> dict:
+    """POST /webhooks/shop/redact"""
+    return _handle_compliance_webhook(event, "shop/redact")
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -264,6 +384,10 @@ def handle_callback(event: dict) -> dict:
 _ROUTES: dict[tuple[str, str], callable] = {
     ("GET", "/install"): handle_install,
     ("GET", "/oauth/callback"): handle_callback,
+    # Compliance webhooks — paths match Shopify topic format
+    ("POST", "/webhooks/customers/data_request"): handle_webhook_customers_data_request,
+    ("POST", "/webhooks/customers/redact"): handle_webhook_customers_redact,
+    ("POST", "/webhooks/shop/redact"): handle_webhook_shop_redact,
 }
 
 
